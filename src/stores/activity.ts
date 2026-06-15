@@ -39,6 +39,25 @@ function timeperiodStrsAroundTimeperiod(timeperiod: TimePeriod): string[] {
   return timeperiodsAroundTimeperiod(timeperiod).map(timeperiodToStr);
 }
 
+function mergeCatEventResults(results: { cat_events: IEvent[] }[]): { cat_events: IEvent[] } {
+  // Sum durations per $category across several categoryQuery results
+  const merged: Record<string, IEvent> = {};
+  for (const r of results) {
+    for (const e of r?.cat_events || []) {
+      const key = JSON.stringify(e.data['$category']);
+      if (!merged[key]) {
+        merged[key] = {
+          timestamp: e.timestamp,
+          duration: 0,
+          data: { $category: e.data['$category'] },
+        };
+      }
+      merged[key].duration += e.duration;
+    }
+  }
+  return { cat_events: Object.values(merged) };
+}
+
 function colorCategories(events: IEvent[]): IEvent[] {
   // Set $color for categories
   const categoryStore = useCategoryStore();
@@ -512,10 +531,27 @@ export const useActivityStore = defineStore('activity', {
                 bid_window: this.buckets.window[0],
               }),
         });
-        const result = await getClient().query([period], query, {
-          verbose: true,
-          name: 'categoryQuery',
-        });
+        const periodSpansFuture = new Date(period.split('/')[1]) > new Date();
+        let result;
+        if (res.startsWith('year') && periodSpansFuture) {
+          // Current, in-progress month of the year view: query each completed day
+          // individually so the aw-client cache can store them; only today re-queries.
+          // Aggregate the per-day results back into a single month-level result.
+          const monthTp = { start: period.split('/')[0], length: [1, 'month'] as [number, string] };
+          const dayPeriods = timeperiodsStrsDaysOfPeriod(monthTp).filter(
+            p => new Date(p.split('/')[0]) < new Date()
+          );
+          const dayResults = await getClient().query(dayPeriods, query, {
+            verbose: true,
+            name: 'categoryQuery',
+          });
+          result = [mergeCatEventResults(dayResults)];
+        } else {
+          result = await getClient().query([period], query, {
+            verbose: true,
+            name: 'categoryQuery',
+          });
+        }
         data = data.concat(result);
       }
 
