@@ -14,6 +14,7 @@ import {
   timeperiodsHoursOfPeriod,
   timeperiodsDaysOfPeriod,
   timeperiodsMonthsOfPeriod,
+  timeperiodsAtomsOfPeriod,
   timeperiodsAroundTimeperiod,
 } from '~/util/timeperiod';
 
@@ -22,6 +23,24 @@ import { useBucketsStore } from '~/stores/buckets';
 import { useCategoryStore } from '~/stores/categories';
 
 import { getClient } from '~/util/awclient';
+import {
+  aggregateWindow,
+  aggregateBrowser,
+  aggregateEditor,
+  mergeCatEvents,
+} from '~/util/aggregate';
+
+// The atomic sub-period strings a period is queried as (see
+// timeperiodsAtomsOfPeriod), dropping atoms that start in the future. They are
+// passed to aw-client in a single query() call: cached atoms are returned
+// instantly and only the uncached ones (e.g. the in-progress atom) are sent in
+// one request, so there's a single aggregation/render rather than per-batch
+// churn from serial requests the server would process serially anyway.
+function atomPeriods(timeperiod: TimePeriod): string[] {
+  return timeperiodsAtomsOfPeriod(timeperiod)
+    .map(timeperiodToStr)
+    .filter(p => new Date(p.split('/')[0]) < new Date());
+}
 
 function timeperiodsStrsHoursOfPeriod(timeperiod: TimePeriod): string[] {
   return timeperiodsHoursOfPeriod(timeperiod).map(timeperiodToStr);
@@ -37,25 +56,6 @@ function timeperiodsStrsMonthsOfPeriod(timeperiod: TimePeriod): string[] {
 
 function timeperiodStrsAroundTimeperiod(timeperiod: TimePeriod): string[] {
   return timeperiodsAroundTimeperiod(timeperiod).map(timeperiodToStr);
-}
-
-function mergeCatEventResults(results: { cat_events: IEvent[] }[]): { cat_events: IEvent[] } {
-  // Sum durations per $category across several categoryQuery results
-  const merged: Record<string, IEvent> = {};
-  for (const r of results) {
-    for (const e of r?.cat_events || []) {
-      const key = JSON.stringify(e.data['$category']);
-      if (!merged[key]) {
-        merged[key] = {
-          timestamp: e.timestamp,
-          duration: 0,
-          data: { $category: e.data['$category'] },
-        };
-      }
-      merged[key].duration += e.duration;
-    }
-  }
-  return { cat_events: Object.values(merged) };
 }
 
 function colorCategories(events: IEvent[]): IEvent[] {
@@ -267,16 +267,9 @@ export const useActivityStore = defineStore('activity', {
         // TODO: These queries can actually run in parallel, but since server won't process them in parallel anyway we won't.
         this.set_available();
 
-        // Query the category timeline first. It drives the most prominent
-        // visualization and, for the current period, none of the queries below
-        // are cache-eligible (they span the future and re-run on every load), so
-        // otherwise the timeline would sit blocked behind the heavy full-window
-        // query for ~seconds before its first bar can paint. It has no dependency
-        // on their results, so it's safe to run up front.
-        if (this.window.available || this.android.available) {
-          await this.query_category_time_by_period(query_options);
-        }
-
+        // Window/browser/timeline all derive from the same per-atom queries
+        // (query_window_atoms), so they paint together and reuse cached atoms
+        // across views. Android stays on the legacy whole-period path.
         if (this.window.available) {
           console.info(
             settingsStore.useMultidevice ? 'Querying multiple devices' : 'Querying a single device'
@@ -298,11 +291,13 @@ export const useActivityStore = defineStore('activity', {
           }
         } else if (this.android.available) {
           await this.query_android(query_options);
+          await this.query_category_time_by_period(query_options);
         } else {
           console.log(
             'Cannot query windows as we are missing either an afk/window bucket pair or an android bucket'
           );
           this.query_window_completed();
+          this.query_browser_completed();
           this.query_category_time_by_period_completed();
         }
 
@@ -352,9 +347,7 @@ export const useActivityStore = defineStore('activity', {
       { timeperiod, filter_categories, filter_afk, always_active_pattern }: QueryOptions,
       hosts: string[]
     ) {
-      const periods = [timeperiodToStr(timeperiod)];
       const categories = useCategoryStore().classes_for_query;
-
       const q = queries.multideviceQuery({
         hosts,
         filter_afk,
@@ -363,8 +356,7 @@ export const useActivityStore = defineStore('activity', {
         host_params: {},
         always_active_pattern,
       });
-      const data = await getClient().query(periods, q, { name: 'multidevice', verbose: true });
-      this.query_window_completed(data[0].window);
+      await this.query_window_atoms(timeperiod, q, false, 'multidevice');
     },
 
     async query_desktop_full({
@@ -375,9 +367,7 @@ export const useActivityStore = defineStore('activity', {
       include_stopwatch,
       always_active_pattern,
     }: QueryOptions) {
-      const periods = [timeperiodToStr(timeperiod)];
       const categories = useCategoryStore().classes_for_query;
-
       const q = queries.fullDesktopQuery({
         bid_window: this.buckets.window[0],
         bid_afk: this.buckets.afk[0],
@@ -392,22 +382,51 @@ export const useActivityStore = defineStore('activity', {
         include_audible,
         always_active_pattern,
       });
-      const data = await getClient().query(periods, q, {
-        name: 'fullDesktopQuery',
-        verbose: true,
-      });
-      this.query_window_completed(data[0].window);
-      this.query_browser_completed(data[0].browser);
+      await this.query_window_atoms(timeperiod, q, true, 'fullDesktopQuery');
+    },
+
+    // Query window (and browser) stats as per-hour/-day/-month atoms (at the
+    // view's bar granularity), aggregating them client-side. All atoms go out in
+    // a single query() call so cached ones return instantly and only uncached
+    // ones (e.g. the in-progress atom) hit the server, with a single
+    // aggregation/render. One query feeds top apps/titles, categories, the
+    // timeline, and (for desktop) browser panels.
+    async query_window_atoms(
+      timeperiod: TimePeriod,
+      query: string[],
+      hasBrowser: boolean,
+      name: string
+    ) {
+      const atoms = atomPeriods(timeperiod);
+      const data = atoms.length
+        ? await getClient().query(atoms, query, { name, verbose: true })
+        : [];
+      const results = _.zipObject(atoms, data);
+
+      const windows = Object.values(results).map((r: any) => r?.window);
+      this.query_window_completed(aggregateWindow(windows));
+      if (hasBrowser) {
+        this.query_browser_completed(
+          aggregateBrowser(Object.values(results).map((r: any) => r?.browser))
+        );
+      }
+      this.query_category_time_by_period_completed({ by_period: this.build_by_period(results) });
+    },
+
+    // Build the timeline's `by_period` map from atom results. Atoms are queried
+    // at the view's bar granularity (hours / days / months), so each atom is one
+    // bar in chronological order.
+    build_by_period(results: Record<string, any>) {
+      return _.mapValues(results, r => ({ cat_events: r?.window?.cat_events || [] }));
     },
 
     async query_editor({ timeperiod }) {
-      const periods = [timeperiodToStr(timeperiod)];
       const q = queries.editorActivityQuery(this.buckets.editor);
-      const data = await getClient().query(periods, q, {
-        name: 'editorActivityQuery',
-        verbose: true,
-      });
-      this.query_editor_completed(data[0]);
+      const atoms = atomPeriods(timeperiod);
+      const data = atoms.length
+        ? await getClient().query(atoms, q, { name: 'editorActivityQuery', verbose: true })
+        : [];
+      this.query_editor_completed(aggregateEditor(data));
     },
 
     async query_active_history({ timeperiod, ...query_options }: QueryOptions) {
@@ -559,7 +578,7 @@ export const useActivityStore = defineStore('activity', {
             verbose: true,
             name: 'categoryQuery',
           });
-          result = mergeCatEventResults(dayResults);
+          result = mergeCatEvents(dayResults);
         } else {
           const queryResult = await getClient().query([period], query, {
             verbose: true,
