@@ -267,6 +267,16 @@ export const useActivityStore = defineStore('activity', {
         // TODO: These queries can actually run in parallel, but since server won't process them in parallel anyway we won't.
         this.set_available();
 
+        // Query the category timeline first. It drives the most prominent
+        // visualization and, for the current period, none of the queries below
+        // are cache-eligible (they span the future and re-run on every load), so
+        // otherwise the timeline would sit blocked behind the heavy full-window
+        // query for ~seconds before its first bar can paint. It has no dependency
+        // on their results, so it's safe to run up front.
+        if (this.window.available || this.android.available) {
+          await this.query_category_time_by_period(query_options);
+        }
+
         if (this.window.available) {
           console.info(
             settingsStore.useMultidevice ? 'Querying multiple devices' : 'Querying a single device'
@@ -310,11 +320,6 @@ export const useActivityStore = defineStore('activity', {
         } else {
           console.log('Cannot call query_editor as we do not have any editor buckets');
           await this.query_editor_completed();
-        }
-
-        // Perform this last, as it takes the longest
-        if (this.window.available || this.android.available) {
-          await this.query_category_time_by_period(query_options);
         }
       } else {
         console.warn(
