@@ -482,8 +482,16 @@ export const useActivityStore = defineStore('activity', {
         console.debug('Request aborted');
       };
 
-      // Query one period at a time, to avoid timeout on slow queries
-      let data = [];
+      // Query one period at a time, to avoid timeout on slow queries.
+      // Results are committed progressively (after each period resolves) so each
+      // bar paints as soon as its data arrives, instead of waiting for every
+      // period — notably the always-uncached current period — to return.
+      // Periods are kept in chronological order so bars fill in left-to-right
+      // against the chart's fixed labels without jumping.
+      const by_period: Record<string, { cat_events: IEvent[] }> = {};
+      const commit = () => {
+        this.query_category_time_by_period_completed({ by_period: { ...by_period } });
+      };
       for (const period of periods) {
         // Not stable
         //signal.throwIfAborted();
@@ -503,7 +511,8 @@ export const useActivityStore = defineStore('activity', {
 
           // Check if there was active time
           if (!(period_activity && period_activity.duration > 0)) {
-            data = data.concat([{ cat_events: [] }]);
+            by_period[period] = { cat_events: [] };
+            commit();
             continue;
           }
         }
@@ -545,22 +554,24 @@ export const useActivityStore = defineStore('activity', {
             verbose: true,
             name: 'categoryQuery',
           });
-          result = [mergeCatEventResults(dayResults)];
+          result = mergeCatEventResults(dayResults);
         } else {
-          result = await getClient().query([period], query, {
+          const queryResult = await getClient().query([period], query, {
             verbose: true,
             name: 'categoryQuery',
           });
+          result = queryResult[0];
         }
-        data = data.concat(result);
+        by_period[period] = result;
+        // Commit progressively so this period's bar renders immediately
+        commit();
       }
 
-      // Zip periods
-      let by_period = _.zipObject(periods, data);
-      // Filter out values that are undefined (no longer needed, only used when visualization was progressive (looks buggy))
-      by_period = _.fromPairs(_.toPairs(by_period).filter(o => o[1]));
-
-      this.query_category_time_by_period_completed({ by_period });
+      // Ensure at least one commit (e.g. when there are no past periods to query),
+      // so the loading state is cleared.
+      if (periods.length === 0) {
+        commit();
+      }
     },
 
     async query_active_history_android({ timeperiod }: QueryOptions) {
